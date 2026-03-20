@@ -89,7 +89,7 @@ class LitModel(L.LightningModule):
 
             yt_hat_sup = self.model_teacher(x_sup)
             y_hat_lidar = self.model(x_lidar)
-            y_hat = yt_hat_sup
+            y_hat = y_hat_lidar
 
             if hasattr(self.hparams, 'teacher_checkpoint_path') and self.hparams.teacher_checkpoint_path is not None:
                 loss_sup = F.mse_loss(y_hat_lidar, y_lidar)
@@ -99,14 +99,15 @@ class LitModel(L.LightningModule):
             x_unsup0 = x_unsup[:, :-1]
             x_unsup1 = x_unsup[:, 1:]
 
-            with torch.no_grad():
-                yt_hat_unsup0 = self.model_teacher(x_unsup0)
-                yt_hat_unsup1 = self.model_teacher(x_unsup1)
+            yt_hat_unsup0 = self.model_teacher(x_unsup0)
+            yt_hat_unsup1 = self.model_teacher(x_unsup1)
 
             y_hat_unsup0 = self.model(x_unsup0)
             y_hat_unsup1 = self.model(x_unsup1)
 
             loss_pseudo = F.mse_loss(y_hat_unsup0, yt_hat_unsup0.detach()) + F.mse_loss(y_hat_unsup1, yt_hat_unsup1.detach())
+            # Keep the motion priors on teacher pseudo predictions, but do not detach them:
+            # this preserves the intended target branch while still allowing gradients to flow.
             loss_dynamic, loss_static = self.loss_fn(x_unsup, yt_hat_unsup0, yt_hat_unsup1)
 
             loss = loss_sup + \
@@ -136,7 +137,16 @@ class LitModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         del batch_idx
-        x, y, c, r = batch['point_clouds'], batch['keypoints'], batch['centroid'], batch['radius']
+        if self.use_teacher:
+            x = batch['point_clouds_ref']
+            y = batch['keypoints_ref']
+            c = batch['centroid_ref']
+            r = batch['radius_ref']
+        else:
+            x = batch['point_clouds']
+            y = batch['keypoints']
+            c = batch['centroid']
+            r = batch['radius']
         loss, loss_dict, y_hat = self._calculate_loss(batch)
 
         log_dict = {f'train_{k}': v for k, v in loss_dict.items()}
