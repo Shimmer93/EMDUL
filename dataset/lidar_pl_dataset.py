@@ -6,17 +6,30 @@ from dataset.reference_dataset import ReferenceDataset
 
 class LiDARAssistedPseudoLabelingDataset(ReferenceDataset):
     def __init__(self, data_path, data_path_ref, transform=None, transform_unsup=None, transform_ref=None, 
-                 split='train', split_ref='train', ratio=1, ratio_ref=1, use_ref=False):
-        super().__init__(data_path, data_path_ref, transform, transform_ref, split, split_ref, ratio, ratio_ref)
+                 split='train', split_ref='train', ratio=1, ratio_ref=1, use_ref=False,
+                 subset_seed=0, subset_seed_ref=0, trim_tail_frames=0):
+        super().__init__(
+            data_path,
+            data_path_ref,
+            transform,
+            transform_ref,
+            split,
+            split_ref,
+            ratio,
+            ratio_ref,
+            subset_seed,
+            subset_seed_ref,
+            trim_tail_frames,
+        )
 
         self.use_ref = use_ref
         self.transform_unsup = transform_unsup
 
         if use_ref:
-            self.split_unsup = self.split_ref_[int(len(self.split_ref_) * ratio_ref):]
+            self.split_unsup = self.split_ref_rest
             self.data_unsup = [self.all_data_ref['sequences'][i] for i in self.split_unsup]
         else:
-            self.split_unsup = self.split_[int(len(self.split_) * ratio):]
+            self.split_unsup = self.split_rest
             self.data_unsup = [self.all_data['sequences'][i] for i in self.split_unsup]
         self.seq_lens_unsup = [len(seq['keypoints']) for seq in self.data_unsup]
         self.len_unsup = int(np.sum(self.seq_lens_unsup))

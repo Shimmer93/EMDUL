@@ -5,8 +5,28 @@ import numpy as np
 from copy import deepcopy
 from itertools import chain
 
+def select_split_subset(split_indices, ratio, subset_seed=0):
+    split_indices = list(split_indices)
+    if ratio >= 1:
+        return split_indices, []
+
+    subset_len = int(len(split_indices) * ratio)
+    if subset_len <= 0:
+        return [], split_indices
+
+    # The development runs used the first fraction of the stored sequence IDs.
+    if subset_seed is None:
+        return split_indices[:subset_len], split_indices[subset_len:]
+
+    rng = np.random.default_rng(subset_seed)
+    subset_positions = set(rng.choice(len(split_indices), size=subset_len, replace=False).tolist())
+    subset = [idx for pos, idx in enumerate(split_indices) if pos in subset_positions]
+    remainder = [idx for pos, idx in enumerate(split_indices) if pos not in subset_positions]
+    return subset, remainder
+
 class BaseDataset(Dataset):
-    def __init__(self, data_path, transform=None, split='train', ratio=1):
+    def __init__(self, data_path, transform=None, split='train', ratio=1, subset_seed=0,
+                 trim_tail_frames=0):
         super().__init__()
         
         self.data_path = data_path
@@ -21,9 +41,11 @@ class BaseDataset(Dataset):
             self.split_ = [self.all_data['splits'][s] for s in split]
             self.split_ = list(chain(*self.split_))
 
-        self.split = self.split_[:int(len(self.split_) * ratio)]
+        self.split, self.split_rest = select_split_subset(self.split_, ratio, subset_seed)
         self.data = [self.all_data['sequences'][i] for i in self.split]
-        self.seq_lens = [len(seq['keypoints']) for seq in self.data]
+        if trim_tail_frames < 0:
+            raise ValueError('trim_tail_frames must be nonnegative')
+        self.seq_lens = [max(0, len(seq['keypoints']) - trim_tail_frames) for seq in self.data]
 
     def __len__(self):
         return int(np.sum(self.seq_lens))

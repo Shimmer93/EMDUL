@@ -4,15 +4,26 @@ from sklearn.cluster import DBSCAN
 from miniball import get_bounding_ball
 
 class AddNoisyPoints():
-    def __init__(self, add_std=0.01, num_added=32, zero_centered=True, center_range=1.5):
+    def __init__(self, add_std=0.01, num_added=32, zero_centered=True, center_range=1.5,
+                 center_joint=None, frame_prob=1.0):
+        if not 0 <= frame_prob <= 1:
+            raise ValueError('frame_prob must be between 0 and 1')
         self.add_std = add_std
         self.num_added = num_added
         self.zero_centered = zero_centered
         self.center_range = center_range
+        self.center_joint = center_joint
+        self.frame_prob = frame_prob
 
     def __call__(self, sample):
         for i in range(len(sample['point_clouds'])):
-            if self.zero_centered:
+            if self.frame_prob < 1 and np.random.rand() >= self.frame_prob:
+                continue
+            if self.center_joint is not None:
+                center = np.asarray(sample['keypoints'][i][self.center_joint])[:3]
+                noise = np.zeros((self.num_added, sample['point_clouds'][i].shape[1]))
+                noise[:, :3] = np.random.normal(center, self.add_std, (self.num_added, 3))
+            elif self.zero_centered:
                 noise = np.random.normal(0, self.add_std, (self.num_added, sample['point_clouds'][i].shape[1]))
             else:
                 noise_center = np.random.uniform(-self.center_range, self.center_range, sample['point_clouds'][i].shape[1])
@@ -120,18 +131,22 @@ class Pad():
         return sample
     
 class MultiFrameAggregate():
-    def __init__(self, num_frames):
+    def __init__(self, num_frames, legacy_two_frames=False):
         self.num_frames = num_frames
         assert num_frames % 2 == 1, 'num_frames must be odd'
         self.offset = (num_frames - 1) // 2
+        if legacy_two_frames and num_frames != 3:
+            raise ValueError('LEMT used a two-frame slice for num_frames=3')
+        self.legacy_two_frames = legacy_two_frames
 
     def __call__(self, sample):
         total_frames = len(sample['point_clouds'])
         if self.num_frames <= total_frames:
             start = self.offset
             stop = total_frames - self.offset
+            right = self.offset if self.legacy_two_frames else self.offset + 1
             sample['point_clouds'] = [
-                np.concatenate(sample['point_clouds'][i - self.offset:i + self.offset + 1])
+                np.concatenate(sample['point_clouds'][i - self.offset:i + right])
                 for i in range(start, stop)
             ]
             if 'keypoints' in sample:
@@ -156,15 +171,16 @@ class RandomScale():
         return sample
     
 class RandomRotate():
-    def __init__(self, angle_min=-np.pi, angle_max=np.pi, deg=False):
+    def __init__(self, angle_min=-np.pi, angle_max=np.pi, deg=False, yaw_only=False):
         if deg:
             angle_min = np.pi * angle_min / 180
             angle_max = np.pi * angle_max / 180
         self.angle_min = angle_min
         self.angle_max = angle_max
+        self.yaw_only = yaw_only
 
     def __call__(self, sample):
-        angle_1 = np.random.uniform(self.angle_min, self.angle_max)
+        angle_1 = 0 if self.yaw_only else np.random.uniform(self.angle_min, self.angle_max)
         angle_2 = np.random.uniform(self.angle_min, self.angle_max)
         rot_matrix = np.array([[np.cos(angle_1), -np.sin(angle_1), 0], [np.sin(angle_1), np.cos(angle_1), 0], [0, 0, 1]]) @ np.array([[np.cos(angle_2), 0, np.sin(angle_2)], [0, 1, 0], [-np.sin(angle_2), 0, np.cos(angle_2)]])
         for i in range(len(sample['point_clouds'])):
@@ -175,11 +191,15 @@ class RandomRotate():
         return sample
     
 class RandomTranslate():
-    def __init__(self, translate_range=0.1):
+    def __init__(self, translate_range=0.1, offset=None):
         self.translate_range = translate_range
+        self.offset = None if offset is None else np.asarray(offset, dtype=float)
+        if self.offset is not None and self.offset.shape != (3,):
+            raise ValueError('offset must have three coordinates')
 
     def __call__(self, sample):
-        translate = np.random.uniform(-self.translate_range, self.translate_range, 3)
+        translate = (np.random.uniform(-self.translate_range, self.translate_range, 3)
+                     if self.offset is None else self.offset)
         for i in range(len(sample['point_clouds'])):
             sample['point_clouds'][i][...,:3] += translate
         if 'keypoints' in sample:
@@ -205,6 +225,25 @@ class RandomJitterKeypoints():
             sample['keypoints'][i][...,:3] += np.random.normal(0, self.jitter_std, sample['keypoints'][i][...,:3].shape)
         return sample
     
+class RandomSample():
+    """Thin dense LiDAR frames before padding. Share the sampling ratio within a clip."""
+    def __init__(self, ratio_min=0.125, ratio_max=1.0, num_points_thres=128,
+                 require_dense_clip=False):
+        self.ratio_min = ratio_min
+        self.ratio_max = ratio_max
+        self.num_points_thres = num_points_thres
+        self.require_dense_clip = require_dense_clip
+
+    def __call__(self, sample):
+        ratio = np.random.uniform(self.ratio_min, self.ratio_max)
+        if self.require_dense_clip and any(len(pc) < self.num_points_thres for pc in sample['point_clouds']):
+            return sample
+        for i, points in enumerate(sample['point_clouds']):
+            if len(points) >= self.num_points_thres:
+                indices = np.random.choice(len(points), max(1, int(len(points) * ratio)), replace=False)
+                sample['point_clouds'][i] = points[indices]
+        return sample
+
 class RandomDrop():
     def __init__(self, drop_prob=0.1):
         self.drop_prob = drop_prob

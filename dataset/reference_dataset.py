@@ -4,12 +4,13 @@ import random
 import numpy as np
 from itertools import chain
 
-from dataset.base_dataset import BaseDataset
+from dataset.base_dataset import BaseDataset, select_split_subset
 
 class ReferenceDataset(BaseDataset):
     def __init__(self, data_path, data_path_ref, transform=None, transform_ref=None, 
-                 split='train', split_ref='train', ratio=1, ratio_ref=1):
-        super().__init__(data_path, transform, split, ratio)
+                 split='train', split_ref='train', ratio=1, ratio_ref=1,
+                 subset_seed=0, subset_seed_ref=0, trim_tail_frames=0):
+        super().__init__(data_path, transform, split, ratio, subset_seed, trim_tail_frames)
         
         self.data_path_ref = data_path_ref
         self.transform_ref = transform_ref
@@ -23,7 +24,7 @@ class ReferenceDataset(BaseDataset):
             self.split_ref_ = [self.all_data_ref['splits'][s] for s in split_ref]
             self.split_ref_ = list(chain(*self.split_ref_))
 
-        self.split_ref = self.split_ref_[:int(len(self.split_ref_) * ratio_ref)]
+        self.split_ref, self.split_ref_rest = select_split_subset(self.split_ref_, ratio_ref, subset_seed_ref)
 
         self.data_ref = [self.all_data_ref['sequences'][i] for i in self.split_ref]
         self.seq_lens_ref = [len(seq['keypoints']) for seq in self.data_ref]

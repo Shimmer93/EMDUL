@@ -1,0 +1,269 @@
+# Source-only training. The 10% radar label split follows paper section 6.1.
+# Use -g 2 -b 64 for global batch 128. Select the student by HmPEAR validation MPJPE.
+strategy: ddp
+benchmark: true
+seed: 3407
+pretrained: false
+sync_batchnorm: false
+clip_grad: null
+precision: 16
+epochs: 100
+train_dataset:
+  name: LiDARAssistedPseudoLabelingDataset
+  params:
+    data_path: data/hmpear.pkl
+    split:
+    - train
+    - val
+    ratio: 1
+    data_path_ref: data/mmfi.pkl
+    split_ref:
+    - train_rdn_p3
+    - val_rdn_p3
+    ratio_ref: 0.1
+    subset_seed_ref: 3407
+    use_ref: true
+    trim_tail_frames: 2
+val_dataset:
+  name: BaseDataset
+  params:
+    data_path: data/hmpear.pkl
+    split: test
+    trim_tail_frames: 1
+test_dataset:
+  name: BaseDataset
+  params:
+    data_path: data/mmfi.pkl
+    split: test_rdn_p3
+predict_dataset:
+  name: BaseDataset
+  params:
+    data_path: data/mmfi.pkl
+    split:
+    - train_rdn_p3
+    - val_rdn_p3
+optim_name: AdamW
+optim_params:
+  lr: 0.0001
+  weight_decay: 1.0e-05
+sched_name: LinearWarmupCosineAnnealingLR
+sched_params:
+  warmup_epochs: 20
+  max_epochs: 100
+  warmup_start_lr: 1.0e-05
+  eta_min: 1.0e-05
+model_name: P4Transformer
+model_params:
+  radius: 0.7
+  nsamples: 32
+  spatial_stride: 8
+  temporal_kernel_size: 3
+  temporal_stride: 1
+  emb_relu: false
+  dim: 1024
+  depth: 5
+  heads: 8
+  dim_head: 128
+  mlp_dim: 2048
+  output_dim: 45
+  features: 1
+  feature_axis: 2
+loss_name: UnsupLoss
+loss_params:
+  thres_static: 0.2
+  thres_dynamic: 0.05
+  thres_loss: 0.05
+w_lidar: 1.0
+temporal_target: teacher
+w_pseudo: 0.1
+w_dynamic: 0.01
+w_static: 0.01
+train_pipeline:
+- name: UniformSample
+  params:
+    pad_type: start
+    clip_len: 6
+- name: ToITOP
+  params: null
+- name: GetCentroid
+  params:
+    centroid_type: kps
+- name: Normalize
+  params:
+    feat_scale: null
+- name: RemoveOutliers
+  params:
+    outlier_type: box
+    radius: 1.5
+- name: FlowBasedPointFiltering
+  params:
+    max_dist_threshold: 0.05
+    min_dist_threshold: 0.02
+    source_frame: true
+    include_keypoint_bounds: false
+    fallback_replace: true
+- name: RandomSample
+  params:
+    ratio_min: 0.9568750181086767
+    ratio_max: 0.9568750181086767
+    num_points_thres: 128
+    require_dense_clip: true
+- name: RandomTranslate
+  params:
+    offset:
+    - -0.006880109593275947
+    - -0.00883832775663601
+    - 0.007323522915498705
+- name: ReduceKeypointLen
+  params:
+    only_one: true
+    keep_type: end
+    frame_to_reduce: 0
+- name: Pad
+  params:
+    max_len: 256
+- name: ToTensor
+  params: null
+val_pipeline:
+- name: UniformSample
+  params:
+    pad_type: start
+    clip_len: 6
+- name: ToITOP
+  params: null
+- name: GetCentroid
+  params:
+    centroid_type: kps
+- name: Normalize
+  params:
+    feat_scale: null
+- name: RemoveOutliers
+  params:
+    outlier_type: box
+    radius: 1.5
+- name: FlowBasedPointFiltering
+  params:
+    max_dist_threshold: 0.05
+    min_dist_threshold: 0.02
+    source_frame: true
+    include_keypoint_bounds: false
+    fallback_replace: true
+- name: ReduceKeypointLen
+  params:
+    only_one: true
+    keep_type: end
+    frame_to_reduce: 0
+- name: Pad
+  params:
+    max_len: 256
+- name: ToTensor
+  params: null
+test_pipeline:
+- name: UniformSample
+  params:
+    pad_type: start
+    clip_len: 5
+- name: GetCentroid
+  params:
+    centroid_type: kps
+- name: ToITOP
+  params: null
+- name: Normalize
+  params:
+    feat_scale: null
+- name: RemoveOutliers
+  params:
+    outlier_type: box
+    radius: 1.5
+- name: ReduceKeypointLen
+  params:
+    only_one: true
+    keep_type: end
+    frame_to_reduce: 0
+- name: Pad
+  params:
+    max_len: 256
+- name: ToTensor
+  params: null
+unsup_pipeline:
+- name: UniformSample
+  params:
+    pad_type: start
+    clip_len: 6
+- name: GetCentroid
+  params:
+    centroid_type: kps
+- name: ToITOP
+  params: null
+- name: Normalize
+  params:
+    feat_scale: null
+- name: RemoveOutliers
+  params:
+    outlier_type: box
+    radius: 1.5
+- name: ReduceKeypointLen
+  params:
+    only_one: false
+    indexs_to_keep:
+    - -2
+    - -1
+- name: Pad
+  params:
+    max_len: 256
+- name: ToTensor
+  params: null
+ref_pipeline:
+- name: UniformSample
+  params:
+    pad_type: start
+    clip_len: 5
+- name: GetCentroid
+  params:
+    centroid_type: kps
+- name: ToITOP
+  params: null
+- name: Normalize
+  params:
+    feat_scale: null
+- name: RemoveOutliers
+  params:
+    outlier_type: box
+    radius: 1.5
+- name: ReduceKeypointLen
+  params:
+    only_one: true
+    keep_type: end
+    frame_to_reduce: 0
+- name: Pad
+  params:
+    max_len: 256
+- name: ToTensor
+  params: null
+predict_pipeline:
+- name: UniformSample
+  params:
+    pad_type: start
+    clip_len: 5
+- name: GetCentroid
+  params:
+    centroid_type: kps
+- name: ToITOP
+  params: null
+- name: Normalize
+  params:
+    feat_scale: null
+- name: RemoveOutliers
+  params:
+    outlier_type: box
+    radius: 1.5
+- name: ReduceKeypointLen
+  params:
+    only_one: true
+    keep_type: end
+    frame_to_reduce: 0
+- name: Pad
+  params:
+    max_len: 256
+- name: ToTensor
+  params: null

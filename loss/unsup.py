@@ -1,12 +1,10 @@
 import torch
-import torch.nn.functional as F
 
-from misc.chamfer_distance import ChamferDistance
-
-def chamfer_mask(chamfer_dist, x, y_hat0, thres_static=0.2, thres_dist=0.1):
-    # Use the source frame, matching FlowBasedPointFiltering/ConvertToRefinedMMWavePointCloud.
-    dists_x, dists_y = chamfer_dist(x[:, 0].to(torch.float), y_hat0[:, 0].to(torch.float))
-    del dists_x
+def chamfer_mask(x, y_hat, thres_static=0.2, thres_dist=0.05):
+    # Thresholds are in meters. The old CUDA Chamfer operator returned squared
+    # distances, and compared the first input frame to the last predicted pose.
+    with torch.no_grad():
+        dists_y = torch.cdist(y_hat[:, 0].float(), x[:, -1, :, :3].float()).amin(dim=-1)
 
     mask_dist_pos = (dists_y < thres_dist).unsqueeze(1).unsqueeze(-1).detach()  # B 1 J 1
     mask_dist_neg = (dists_y > thres_static).unsqueeze(1).unsqueeze(-1).detach()  # B 1 J 1
@@ -21,7 +19,6 @@ class UnsupLoss(torch.nn.Module):
         if self.thres_dist is None:
             self.thres_dist = 0.1
         self.thres_loss = thres_loss
-        self.chamfer_dist = ChamferDistance()
 
     def forward(self, x, y_hat0, y_hat1):
         # x: B T N C
@@ -29,9 +26,8 @@ class UnsupLoss(torch.nn.Module):
         # y_hat1: B 1 J 3
 
         mask_dist_pos, mask_dist_neg = chamfer_mask(
-            self.chamfer_dist,
-            x[:, :1, :, :3],
-            y_hat0,
+            x,
+            y_hat1,
             self.thres_static,
             self.thres_dist,
         )
@@ -40,15 +36,15 @@ class UnsupLoss(torch.nn.Module):
 
         dynamic_disp = displacement[mask_dist_pos.expand_as(displacement)].view(-1, displacement.shape[-1])
         if dynamic_disp.numel() == 0:
-            loss_dynamic = displacement.new_zeros(())
+            loss_dynamic = displacement.sum() * 0
         else:
             dynamic_norm = torch.norm(dynamic_disp, p=2, dim=-1)
             loss_dynamic = torch.relu(self.thres_loss - dynamic_norm).mean()
         
         static_disp = displacement[mask_dist_neg.expand_as(displacement)].view(-1, displacement.shape[-1])
         if static_disp.numel() == 0:
-            loss_static = displacement.new_zeros(())
+            loss_static = displacement.sum() * 0
         else:
-            loss_static = F.mse_loss(static_disp, torch.zeros_like(static_disp))
+            loss_static = torch.norm(static_disp, p=2, dim=-1).mean()
 
         return loss_dynamic, loss_static

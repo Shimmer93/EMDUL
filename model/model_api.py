@@ -58,17 +58,18 @@ class LitModel(L.LightningModule):
             self.model_teacher = create_model(self.hparams.model_name, self.hparams.model_params)
             if hasattr(hparams, 'teacher_checkpoint_path') and hparams.teacher_checkpoint_path is not None:
                 teacher_state_dict = torch.load(hparams.teacher_checkpoint_path, map_location=self.device)['state_dict']
-                cleaned_state_dict = {}
-                for key, value in teacher_state_dict.items():
-                    if key.startswith('model_teacher.'):
-                        cleaned_state_dict[key[len('model_teacher.'):]] = value
-                    elif key.startswith('model.'):
-                        cleaned_state_dict[key[len('model.'):]] = value
-                if cleaned_state_dict:
-                    self.model_teacher.load_state_dict(cleaned_state_dict, strict=False)
+                prefix = 'model_teacher.' if any(key.startswith('model_teacher.') for key in teacher_state_dict) else 'model.'
+                self.model_teacher.load_state_dict({
+                    key[len(prefix):]: value for key, value in teacher_state_dict.items() if key.startswith(prefix)
+                })
 
         if hparams.checkpoint_path is not None:
-            self.load_state_dict(torch.load(hparams.checkpoint_path, map_location=self.device)['state_dict'], strict=False)
+            state = torch.load(hparams.checkpoint_path, map_location=self.device)['state_dict']
+            # An inference-only checkpoint may omit the teacher, but must load every student tensor.
+            missing, _ = self.load_state_dict(state, strict=False)
+            missing_student = [key for key in missing if key.startswith('model.')]
+            if missing_student:
+                raise ValueError(f'Incomplete inference model in {hparams.checkpoint_path}: {missing_student}')
         self.loss_fn = create_loss(self.hparams.loss_name, self.hparams.loss_params)
 
     def _recover_data(self, data, centroid, radius):
@@ -83,18 +84,19 @@ class LitModel(L.LightningModule):
 
     def _calculate_loss(self, batch):
         if self.use_teacher:
-            x_sup, y_sup = batch['point_clouds'], batch['keypoints']
+            x_primary, y_primary = batch['point_clouds'], batch['keypoints']
             x_unsup = batch['point_clouds_unsup']
-            x_lidar, y_lidar = batch['point_clouds_ref'], batch['keypoints_ref']
-
-            yt_hat_sup = self.model_teacher(x_sup)
-            y_hat_lidar = self.model(x_lidar)
-            y_hat = y_hat_lidar
-
-            if hasattr(self.hparams, 'teacher_checkpoint_path') and self.hparams.teacher_checkpoint_path is not None:
-                loss_sup = F.mse_loss(y_hat_lidar, y_lidar)
+            x_ref, y_ref = batch['point_clouds_ref'], batch['keypoints_ref']
+            y_hat = self.model(x_primary)
+            yt_primary = self.model_teacher(x_primary)
+            loss_primary = F.mse_loss(y_hat, y_primary) + F.mse_loss(yt_primary, y_primary)
+            loss_ref = F.mse_loss(self.model(x_ref), y_ref) + F.mse_loss(
+                self.model_teacher(x_ref), y_ref)
+            # The unlabeled radar pool identifies which labeled stream is radar.
+            if self.hparams.train_dataset['params'].get('use_ref', False):
+                loss_sup, loss_lidar = loss_ref, loss_primary
             else:
-                loss_sup = F.mse_loss(yt_hat_sup, y_sup) + F.mse_loss(y_hat_lidar, y_lidar)
+                loss_sup, loss_lidar = loss_primary, loss_ref
 
             x_unsup0 = x_unsup[:, :-1]
             x_unsup1 = x_unsup[:, 1:]
@@ -106,16 +108,19 @@ class LitModel(L.LightningModule):
             y_hat_unsup1 = self.model(x_unsup1)
 
             loss_pseudo = F.mse_loss(y_hat_unsup0, yt_hat_unsup0.detach()) + F.mse_loss(y_hat_unsup1, yt_hat_unsup1.detach())
-            # Keep the motion priors on teacher pseudo predictions, but do not detach them:
-            # this preserves the intended target branch while still allowing gradients to flow.
-            loss_dynamic, loss_static = self.loss_fn(x_unsup, yt_hat_unsup0, yt_hat_unsup1)
+            # The estimator learns temporal consistency; only pseudo targets detach.
+            # "student" reproduces the online loss placement in the development repo.
+            if getattr(self.hparams, 'temporal_target', 'teacher') == 'student':
+                loss_dynamic, loss_static = self.loss_fn(x_unsup, y_hat_unsup0, y_hat_unsup1)
+            else:
+                loss_dynamic, loss_static = self.loss_fn(x_unsup, yt_hat_unsup0, yt_hat_unsup1)
 
-            loss = loss_sup + \
+            loss = loss_sup + getattr(self.hparams, 'w_lidar', 1.0) * loss_lidar + \
                    self.hparams.w_pseudo * loss_pseudo + \
                    self.hparams.w_dynamic * loss_dynamic + \
                    self.hparams.w_static * loss_static
             
-            loss_dict = {'loss_sup': loss_sup.item(),
+            loss_dict = {'loss_sup': loss_sup.item(), 'loss_lidar': loss_lidar.item(),
                          'loss_pseudo': loss_pseudo.item(), 'loss_dynamic': loss_dynamic.item(), 
                          'loss_static': loss_static.item(), 'loss': loss.item()}
 
@@ -137,50 +142,43 @@ class LitModel(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         del batch_idx
-        if self.use_teacher:
-            x = batch['point_clouds_ref']
-            y = batch['keypoints_ref']
-            c = batch['centroid_ref']
-            r = batch['radius_ref']
-        else:
-            x = batch['point_clouds']
-            y = batch['keypoints']
-            c = batch['centroid']
-            r = batch['radius']
         loss, loss_dict, y_hat = self._calculate_loss(batch)
+        del y_hat
 
         log_dict = {f'train_{k}': v for k, v in loss_dict.items()}
-        x_rec, y_rec, y_hat_rec = self._recover_all(x, y, y_hat, c, r)
-        mpjpe, pampjpe = calculate_error(y_hat_rec, y_rec)
-        log_dict = {**log_dict, 'train_mpjpe': mpjpe, 'train_pampjpe': pampjpe}
 
-        self.log_dict(log_dict, prog_bar=True, on_epoch=True, sync_dist=True)
+        # Training metrics based on CPU/Numpy recovery are expensive and can stall DDP.
+        self.log_dict(log_dict, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
         x, y, c, r = batch['point_clouds'], batch['keypoints'], batch['centroid'], batch['radius']
         y_hat = self.model(x)
 
-        x_rec, y_rec, y_hat_rec = self._recover_all(x, y, y_hat, c, r)
+        y_rec = self._recover_data(y.clone().detach(), c, r)
+        y_hat_rec = self._recover_data(y_hat.clone().detach(), c, r)
         mpjpe, pampjpe = calculate_error(y_hat_rec, y_rec)
         log_dict = {'val_mpjpe': mpjpe, 'val_pampjpe': pampjpe}
 
-        self.log_dict(log_dict, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
 
         if batch_idx == 10:
+            x_rec = self._recover_data(x.clone().detach(), c, r)
             self._visualize(x_rec, y_rec, y_hat_rec)
 
     def test_step(self, batch, batch_idx):
         x, y, c, r = batch['point_clouds'], batch['keypoints'], batch['centroid'], batch['radius']
         y_hat = self.model(x)
 
-        x_rec, y_rec, y_hat_rec = self._recover_all(x, y, y_hat, c, r)
+        y_rec = self._recover_data(y.clone().detach(), c, r)
+        y_hat_rec = self._recover_data(y_hat.clone().detach(), c, r)
         mpjpe, pampjpe = calculate_error(y_hat_rec, y_rec)
         log_dict = {'test_mpjpe': mpjpe, 'test_pampjpe': pampjpe}
 
-        self.log_dict(log_dict, prog_bar=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
 
         if batch_idx == 10:
+            x_rec = self._recover_data(x.clone().detach(), c, r)
             self._visualize(x_rec, y_rec, y_hat_rec)
 
     def predict_step(self, batch, batch_idx):

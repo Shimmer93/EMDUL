@@ -10,9 +10,10 @@ class P4Transformer(nn.Module):
                  temporal_kernel_size, temporal_stride,                                 # P4DConv: temporal
                  emb_relu,                                                              # embedding: relu
                  dim, depth, heads, dim_head,                                           # transformer
-                 mlp_dim, output_dim, features=3):                                                 # output
+                 mlp_dim, output_dim, features=3, feature_axis=1):                                  # output
         super().__init__()
         self.num_input_features = features
+        self.feature_axis = feature_axis
 
         self.tube_embedding = P4DConv(in_planes=features, mlp_planes=[dim], mlp_batch_norm=[False], mlp_activation=[False],
                                   spatial_kernel_size=[radius, nsamples], spatial_stride=spatial_stride,
@@ -31,15 +32,21 @@ class P4Transformer(nn.Module):
             nn.Linear(mlp_dim, output_dim),
         )
 
+    def _extract_input_features(self, input):
+        if self.num_input_features <= 0:
+            return None
+
+        # Default to height. Historical checkpoints can specify the channel they trained on.
+        if not 0 <= self.feature_axis < input.shape[-1]:
+            raise ValueError(f'Feature channel {self.feature_axis} missing from input {input.shape}')
+        feature = input[:, :, :, self.feature_axis:self.feature_axis + 1]
+        if self.num_input_features == 1:
+            return feature
+        return feature.expand(*feature.shape[:-1], self.num_input_features)
+
     def forward(self, input):
         device = input.device
-        # Prefer explicit feature channels when they exist; fall back to XYZ only inputs.
-        input_feat = None
-        if self.num_input_features > 0:
-            if input.shape[-1] >= 3 + self.num_input_features:
-                input_feat = input[:, :, :, 3:3 + self.num_input_features]
-            else:
-                input_feat = input[:, :, :, 3 - self.num_input_features:3]
+        input_feat = self._extract_input_features(input)
 
         xyzs, features = self.tube_embedding(
             input[:, :, :, :3],
